@@ -1,0 +1,10 @@
+{
+  "city": {
+    "i": "interact"
+  },
+  "global": {
+    "ll": "ls",
+    "nano": "vim"
+  },
+  "hacknet": {}
+}
