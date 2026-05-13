@@ -378,6 +378,74 @@ type playerStats struct {
 	CurrentWork *string `json:"currentWork"`
 }
 
+type creatableProgramInfo struct {
+	Name        string  `json:"name"`
+	ReqLevel    int     `json:"reqLevel"`
+	Time        float64 `json:"time"`
+	Description string  `json:"description"`
+	Owned       bool    `json:"owned"`
+	ReqMet      bool    `json:"reqMet"`
+	Progress    float64 `json:"progress"`
+}
+
+type programProgressResult struct {
+	ProgramName string  `json:"programName"`
+	Progress    float64 `json:"progress"`
+}
+
+type serverScriptGroup struct {
+	Hostname string          `json:"hostname"`
+	RamUsed  float64         `json:"ramUsed"`
+	RamMax   float64         `json:"ramMax"`
+	Scripts  []runningScript `json:"scripts"`
+}
+
+type saveFileResult struct {
+	Identifier string `json:"identifier"`
+	Binary     bool   `json:"binary"`
+	Save       string `json:"save"`
+}
+
+type factionAugInfo struct {
+	Name        string  `json:"name"`
+	RepCost     float64 `json:"repCost"`
+	MoneyCost   float64 `json:"moneyCost"`
+	Owned       bool    `json:"owned"`
+	Queued      bool    `json:"queued"`
+	CanAfford   bool    `json:"canAfford"`
+	HasRep      bool    `json:"hasRep"`
+	HasPrereqs  bool    `json:"hasPrereqs"`
+}
+
+type factionInfoResult struct {
+	Name               string           `json:"name"`
+	Rep                float64          `json:"rep"`
+	Favor              float64          `json:"favor"`
+	OfferHackingWork   bool             `json:"offerHackingWork"`
+	OfferFieldWork     bool             `json:"offerFieldWork"`
+	OfferSecurityWork  bool             `json:"offerSecurityWork"`
+	Augmentations      []factionAugInfo `json:"augmentations"`
+}
+
+type ownedAugEntry struct {
+	Name  string `json:"name"`
+	Level int    `json:"level"`
+}
+
+type sourceFileEntry struct {
+	N     int `json:"n"`
+	Level int `json:"level"`
+}
+
+type augmentationsStatus struct {
+	Installed   []ownedAugEntry    `json:"installed"`
+	Queued      []ownedAugEntry    `json:"queued"`
+	NFGLevel    int                `json:"nfgLevel"`
+	Entropy     int                `json:"entropy"`
+	SourceFiles []sourceFileEntry  `json:"sourceFiles"`
+	Mults       map[string]float64 `json:"mults"`
+}
+
 // ── Global state ──────────────────────────────────────────────────────────────
 
 var (
@@ -481,12 +549,14 @@ type session struct {
 	statusBar        *tview.TextView
 	contextRefreshFn func(ws *websocket.Conn) // nil = show server info
 	seenInvites      map[string]bool          // faction invites already notified
+	readInvites      map[string]bool          // faction invites dismissed from badge
 	currentRepl      string                   // active repl scope for aliases: "global","city","location","hacknet","cloud"
 	cityHandler      cityHandlerFn
 	serverFiles      []string      // cached filenames for the current server
 	serverNames      []string      // cached hostnames of all known servers
 	neighbourNames   []string      // cached 1-hop reachable hostnames from current server
 	cityLocations    []string      // cached location names for the current city
+	programNames     []string      // cached creatable (not yet owned) program names
 	subCmds          []string      // nil = top-level; set to available cmds while in a sub-repl
 	tabActive        bool          // true for one autocomplete call when Tab is pressed
 	dropdownOpen     bool          // true while the autocomplete dropdown is visible
@@ -753,6 +823,8 @@ func (s *session) computeCompletions(text string) []string {
 			candidates = []string{"list"}
 		case cmd == "bj" && argIdx == 1:
 			candidates = []string{"deal", "hit", "stand"}
+		case cmd == "create" && argIdx == 1:
+			candidates = s.programNames
 		}
 	}
 
@@ -1273,6 +1345,38 @@ func init() {
 		}},
 		{"getSaveFile", func(ws *websocket.Conn, out io.Writer, sess *session, parts []string) {
 			sendMsg(ws, out, "getSaveFile", nil)
+		}},
+		{"export_game", func(ws *websocket.Conn, out io.Writer, sess *session, parts []string) {
+			raw, err := sendMsgSync(ws, "getSaveFile", nil)
+			if err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				return
+			}
+			var result saveFileResult
+			if err := json.Unmarshal(raw, &result); err != nil {
+				fmt.Fprintf(out, "error parsing save data: %v\n", err)
+				return
+			}
+			ext := "json"
+			if result.Binary {
+				ext = "json.gz"
+			}
+			filename := fmt.Sprintf("bitburnerSave_%d.%s", time.Now().Unix(), ext)
+			var data []byte
+			if result.Binary {
+				// each char in Save encodes one raw byte of the gzip stream
+				data = make([]byte, len(result.Save))
+				for i, ch := range result.Save {
+					data[i] = byte(ch)
+				}
+			} else {
+				data = []byte(result.Save)
+			}
+			if err := os.WriteFile(filename, data, 0644); err != nil {
+				fmt.Fprintf(out, "error writing file: %v\n", err)
+				return
+			}
+			fmt.Fprintf(out, "saved to %s (%d bytes)\n", filename, len(data))
 		}},
 		{"calculateRam", func(ws *websocket.Conn, out io.Writer, sess *session, parts []string) {
 			if len(parts) < 3 {
@@ -3375,6 +3479,654 @@ func init() {
 			default:
 			}
 		}},
+		{"factions", func(ws *websocket.Conn, out io.Writer, sess *session, parts []string) {
+			printFactions := func(facs []factionInfoResult) {
+				w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+				fmt.Fprintln(w, "Name\tRep\tFavor\tWork")
+				for _, f := range facs {
+					var workTypes []string
+					if f.OfferHackingWork {
+						workTypes = append(workTypes, "hacking")
+					}
+					if f.OfferFieldWork {
+						workTypes = append(workTypes, "field")
+					}
+					if f.OfferSecurityWork {
+						workTypes = append(workTypes, "security")
+					}
+					wt := strings.Join(workTypes, "/")
+					if wt == "" {
+						wt = "—"
+					}
+					fmt.Fprintf(w, "%s\t%s\t%.0f\t%s\n", f.Name, formatMoney(f.Rep), f.Favor, wt)
+				}
+				w.Flush()
+			}
+
+			fetchFactions := func(ws *websocket.Conn) ([]factionInfoResult, error) {
+				raw, err := sendMsgSync(ws, "getFactions", nil)
+				if err != nil {
+					return nil, err
+				}
+				var facs []factionInfoResult
+				if err := json.Unmarshal(raw, &facs); err != nil {
+					return nil, err
+				}
+				return facs, nil
+			}
+
+			facs, err := fetchFactions(ws)
+			if err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				return
+			}
+			printFactions(facs)
+			fmt.Fprintln(out)
+			fmt.Fprintln(out, "Commands: ls  invites  join <faction>  info <faction>  work <faction> [type]  stop  share [gb]  augs <faction>  buy <faction> <aug>  exit")
+
+			prevHandler := sess.cityHandler
+			sess.setPromptStr("[cyan][[white]factions[cyan]][-] [green]>[-] ")
+			sess.setSubCompleter([]string{"ls", "invites", "markread", "join", "info", "work", "stop", "share", "augs", "buy", "help", "alias", "unalias", "exit"})
+			sess.currentRepl = "factions"
+			inSubMode.Store(true)
+
+			sess.setContextRefresh("Factions", func(ws *websocket.Conn) {
+				f2, err2 := fetchFactions(ws)
+				if err2 != nil {
+					return
+				}
+				var sb strings.Builder
+				fmt.Fprintf(&sb, " [yellow]Factions: %d[-]\n", len(f2))
+				sb.WriteString(ctxSep)
+				for _, f := range f2 {
+					fmt.Fprintf(&sb, " [green]%s[-]\n", f.Name)
+					fmt.Fprintf(&sb, "  rep   %s\n", formatMoney(f.Rep))
+					fmt.Fprintf(&sb, "  favor %.0f\n", f.Favor)
+				}
+				text := sb.String()
+				sess.app.QueueUpdateDraw(func() { sess.contextView.SetText(text) })
+			})
+
+			sess.cityHandler = func(ws *websocket.Conn, out io.Writer, sess *session, line string) bool {
+				lp := strings.Fields(line)
+				if len(lp) == 0 {
+					return true
+				}
+				switch strings.ToLower(lp[0]) {
+				case "exit", "quit":
+					sess.cityHandler = prevHandler
+					if prevHandler == nil {
+						inSubMode.Store(false)
+					}
+					sess.currentRepl = "global"
+					sess.restoreCompleter()
+					sess.updatePrompt()
+					sess.clearContextRefresh()
+
+				case "ls", "list":
+					f2, err2 := fetchFactions(ws)
+					if err2 != nil {
+						fmt.Fprintf(out, "error: %v\n", err2)
+						return true
+					}
+					printFactions(f2)
+
+				case "invites":
+					raw, err2 := sendMsgSync(ws, "getFactionInvitations", nil)
+					if err2 != nil {
+						fmt.Fprintf(out, "error: %v\n", err2)
+						return true
+					}
+					var invites []string
+					if json.Unmarshal(raw, &invites) != nil || len(invites) == 0 {
+						fmt.Fprintln(out, "No pending faction invitations.")
+						return true
+					}
+					for _, name := range invites {
+						if sess.readInvites[name] {
+							fmt.Fprintf(out, "  %s  [darkgray](read)[-]\n", name)
+						} else {
+							fmt.Fprintf(out, "  %s\n", name)
+						}
+					}
+
+				case "markread":
+					if len(lp) < 2 {
+						fmt.Fprintln(out, "usage: markread <faction>")
+						return true
+					}
+					name := strings.Join(lp[1:], " ")
+					if sess.readInvites == nil {
+						sess.readInvites = make(map[string]bool)
+					}
+					sess.readInvites[name] = true
+					sess.seenInvites[name] = true
+					fmt.Fprintf(out, "Invite from '%s' marked read — badge suppressed. Use 'join %s' to accept later.\n", name, name)
+
+				case "join":
+					if len(lp) < 2 {
+						fmt.Fprintln(out, "usage: join <faction>")
+						return true
+					}
+					name := strings.Join(lp[1:], " ")
+					raw, err2 := sendMsgSync(ws, "joinFaction", map[string]string{"location": name})
+					if err2 != nil {
+						fmt.Fprintf(out, "error: %v\n", err2)
+						return true
+					}
+					var result string
+					if json.Unmarshal(raw, &result) == nil {
+						fmt.Fprintln(out, result)
+					}
+					if sess.seenInvites != nil {
+						delete(sess.seenInvites, name)
+					}
+					select {
+					case sess.serverRefreshCh <- struct{}{}:
+					default:
+					}
+
+				case "info":
+					if len(lp) < 2 {
+						fmt.Fprintln(out, "usage: info <faction>")
+						return true
+					}
+					name := strings.Join(lp[1:], " ")
+					f2, err2 := fetchFactions(ws)
+					if err2 != nil {
+						fmt.Fprintf(out, "error: %v\n", err2)
+						return true
+					}
+					var found *factionInfoResult
+					for i := range f2 {
+						if strings.EqualFold(f2[i].Name, name) {
+							found = &f2[i]
+							break
+						}
+					}
+					if found == nil {
+						fmt.Fprintf(out, "not a member of faction '%s'\n", name)
+						return true
+					}
+					fmt.Fprintf(out, "%s  rep %s  favor %.0f\n", found.Name, formatMoney(found.Rep), found.Favor)
+					var types []string
+					if found.OfferHackingWork {
+						types = append(types, "hacking")
+					}
+					if found.OfferFieldWork {
+						types = append(types, "field")
+					}
+					if found.OfferSecurityWork {
+						types = append(types, "security")
+					}
+					if len(types) > 0 {
+						fmt.Fprintf(out, "Work: %s\n", strings.Join(types, ", "))
+					} else {
+						fmt.Fprintln(out, "Work: none")
+					}
+					buyable := 0
+					for _, a := range found.Augmentations {
+						if !a.Owned && !a.Queued {
+							buyable++
+						}
+					}
+					fmt.Fprintf(out, "Augmentations: %d total, %d buyable (use 'augs %s')\n", len(found.Augmentations), buyable, found.Name)
+
+				case "work":
+					if len(lp) < 2 {
+						fmt.Fprintln(out, "usage: work <faction> [hacking|field|security]")
+						return true
+					}
+					workType := "hacking"
+					facParts := lp[1:]
+					last := strings.ToLower(facParts[len(facParts)-1])
+					if last == "hacking" || last == "field" || last == "security" {
+						workType = last
+						facParts = facParts[:len(facParts)-1]
+					}
+					if len(facParts) == 0 {
+						fmt.Fprintln(out, "usage: work <faction> [hacking|field|security]")
+						return true
+					}
+					facName := strings.Join(facParts, " ")
+					raw, err2 := sendMsgSync(ws, "doFactionWork", map[string]string{"location": facName, "field": workType})
+					if err2 != nil {
+						fmt.Fprintf(out, "error: %v\n", err2)
+						return true
+					}
+					var result string
+					if json.Unmarshal(raw, &result) == nil {
+						fmt.Fprintln(out, result)
+					}
+					select {
+					case sess.serverRefreshCh <- struct{}{}:
+					default:
+					}
+
+				case "stop":
+					raw, err2 := sendMsgSync(ws, "stopWork", nil)
+					if err2 != nil {
+						fmt.Fprintf(out, "error: %v\n", err2)
+						return true
+					}
+					var result string
+					if json.Unmarshal(raw, &result) == nil {
+						fmt.Fprintln(out, result)
+					}
+					select {
+					case sess.serverRefreshCh <- struct{}{}:
+					default:
+					}
+
+				case "share":
+					// share [gb] — share free RAM from home for 10s rep bonus
+					params := map[string]string{}
+					if len(lp) >= 2 {
+						params["stat"] = lp[1]
+					}
+					raw, err2 := sendMsgSync(ws, "shareRAM", params)
+					if err2 != nil {
+						fmt.Fprintf(out, "error: %v\n", err2)
+						return true
+					}
+					var result string
+					if json.Unmarshal(raw, &result) == nil {
+						fmt.Fprintln(out, result)
+					}
+
+				case "augs":
+					if len(lp) < 2 {
+						fmt.Fprintln(out, "usage: augs <faction>")
+						return true
+					}
+					name := strings.Join(lp[1:], " ")
+					f2, err2 := fetchFactions(ws)
+					if err2 != nil {
+						fmt.Fprintf(out, "error: %v\n", err2)
+						return true
+					}
+					var found *factionInfoResult
+					for i := range f2 {
+						if strings.EqualFold(f2[i].Name, name) {
+							found = &f2[i]
+							break
+						}
+					}
+					if found == nil {
+						fmt.Fprintf(out, "not a member of faction '%s'\n", name)
+						return true
+					}
+					w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+					fmt.Fprintln(w, "Augmentation\tRep\tCost\tStatus")
+					for _, a := range found.Augmentations {
+						var status string
+						switch {
+						case a.Owned:
+							status = "owned"
+						case a.Queued:
+							status = "queued"
+						case !a.HasPrereqs:
+							status = "missing prereqs"
+						case !a.HasRep:
+							status = fmt.Sprintf("need %s rep", formatMoney(a.RepCost))
+						case !a.CanAfford:
+							status = fmt.Sprintf("need %s", formatMoney(a.MoneyCost))
+						default:
+							status = fmt.Sprintf("buy for %s", formatMoney(a.MoneyCost))
+						}
+						fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", a.Name, formatMoney(a.RepCost), formatMoney(a.MoneyCost), status)
+					}
+					w.Flush()
+
+				case "buy":
+					if len(lp) < 3 {
+						fmt.Fprintln(out, "usage: buy <faction> <augmentation>")
+						return true
+					}
+					augName := lp[len(lp)-1]
+					facName := strings.Join(lp[1:len(lp)-1], " ")
+					raw, err2 := sendMsgSync(ws, "buyFactionAug", map[string]string{"location": facName, "stat": augName})
+					if err2 != nil {
+						fmt.Fprintf(out, "error: %v\n", err2)
+						return true
+					}
+					var result string
+					if json.Unmarshal(raw, &result) == nil {
+						fmt.Fprintln(out, result)
+					}
+					select {
+					case sess.serverRefreshCh <- struct{}{}:
+					default:
+					}
+
+				case "alias":
+					am := replAliases(sess.currentRepl)
+					if len(lp) < 2 {
+						if len(am) == 0 {
+							fmt.Fprintln(out, "no aliases defined")
+						} else {
+							keys := make([]string, 0, len(am))
+							for k := range am {
+								keys = append(keys, k)
+							}
+							sort.Strings(keys)
+							for _, k := range keys {
+								fmt.Fprintf(out, "alias %s=%q\n", k, am[k])
+							}
+						}
+						return true
+					}
+					name := lp[1]
+					value := strings.Join(lp[2:], " ")
+					if value == "" && strings.Contains(name, "=") {
+						idx := strings.IndexByte(name, '=')
+						value = name[idx+1:]
+						name = name[:idx]
+					}
+					am[name] = value
+					saveAliases()
+					fmt.Fprintf(out, "alias %s=%q\n", name, value)
+
+				case "unalias":
+					if len(lp) < 2 {
+						fmt.Fprintln(out, "usage: unalias <name>")
+						return true
+					}
+					delete(replAliases(sess.currentRepl), lp[1])
+					saveAliases()
+
+				case "help":
+					helpTable(out, "Factions", [][2]string{
+						{"ls", "List joined factions with rep, favor, and work types"},
+						{"invites", "List pending faction invitations"},
+						{"markread <faction>", "Suppress invite badge without joining"},
+						{"join <faction>", "Accept a pending faction invitation"},
+						{"info <faction>", "Show faction details and augmentation count"},
+						{"work <faction> [type]", "Start working for a faction (hacking/field/security)"},
+						{"stop", "Stop current work"},
+						{"share [gb]", "Share home RAM for 10s rep multiplier bonus (default: all free)"},
+						{"augs <faction>", "List augmentations available from a faction"},
+						{"buy <faction> <aug>", "Purchase an augmentation from a faction"},
+					})
+					helpTable(out, "Shell", [][2]string{
+						{"alias [name=\"value\"]", "Define an alias"},
+						{"unalias <name>", "Remove an alias"},
+						{"help", "Show this help"},
+						{"exit", "Return to top-level"},
+					})
+
+				default:
+					fmt.Fprintf(out, "unknown command: %s\n", lp[0])
+				}
+				return true
+			}
+		}},
+		{"augmentations", func(ws *websocket.Conn, out io.Writer, sess *session, parts []string) {
+			// Pretty-printers for the augmentations status.
+			printInstalled := func(st *augmentationsStatus) {
+				if len(st.Installed) == 0 {
+					fmt.Fprintln(out, "No augmentations installed.")
+				} else {
+					names := make([]ownedAugEntry, len(st.Installed))
+					copy(names, st.Installed)
+					sort.Slice(names, func(i, j int) bool { return names[i].Name < names[j].Name })
+					w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+					fmt.Fprintln(w, "Augmentation\tLevel")
+					for _, a := range names {
+						fmt.Fprintf(w, "%s\t%d\n", a.Name, a.Level)
+					}
+					w.Flush()
+				}
+				if st.NFGLevel > 0 {
+					fmt.Fprintf(out, "\nNeuroFlux Governor: level %d\n", st.NFGLevel)
+				}
+				if st.Entropy > 0 {
+					fmt.Fprintf(out, "Entropy Virus: level %d\n", st.Entropy)
+				}
+			}
+
+			printQueued := func(st *augmentationsStatus) {
+				if len(st.Queued) == 0 {
+					fmt.Fprintln(out, "Nothing queued for installation.")
+					return
+				}
+				w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+				fmt.Fprintln(w, "Augmentation\tLevel")
+				for _, a := range st.Queued {
+					fmt.Fprintf(w, "%s\t%d\n", a.Name, a.Level)
+				}
+				w.Flush()
+				fmt.Fprintf(out, "\n%d augmentation(s) queued. Run 'install --confirm' to apply.\n", len(st.Queued))
+			}
+
+			printMults := func(st *augmentationsStatus) {
+				keys := make([]string, 0, len(st.Mults))
+				for k, v := range st.Mults {
+					if v != 1.0 {
+						keys = append(keys, k)
+					}
+				}
+				if len(keys) == 0 {
+					fmt.Fprintln(out, "No active multipliers (all at default 1.0×).")
+					return
+				}
+				sort.Strings(keys)
+				w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+				fmt.Fprintln(w, "Multiplier\tEffect")
+				for _, k := range keys {
+					v := st.Mults[k]
+					pct := (v - 1.0) * 100
+					sign := "+"
+					if pct < 0 {
+						sign = ""
+					}
+					fmt.Fprintf(w, "%s\t%s%.1f%%\n", k, sign, pct)
+				}
+				w.Flush()
+			}
+
+			printSourceFiles := func(st *augmentationsStatus) {
+				if len(st.SourceFiles) == 0 {
+					fmt.Fprintln(out, "No source files owned.")
+					return
+				}
+				sfs := make([]sourceFileEntry, len(st.SourceFiles))
+				copy(sfs, st.SourceFiles)
+				sort.Slice(sfs, func(i, j int) bool { return sfs[i].N < sfs[j].N })
+				w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+				fmt.Fprintln(w, "BitNode\tLevel")
+				for _, s := range sfs {
+					fmt.Fprintf(w, "BN-%d\t%d\n", s.N, s.Level)
+				}
+				w.Flush()
+			}
+
+			fetchStatus := func(ws *websocket.Conn) (*augmentationsStatus, error) {
+				raw, err := sendMsgSync(ws, "getAugmentationsStatus", nil)
+				if err != nil {
+					return nil, err
+				}
+				var st augmentationsStatus
+				if err := json.Unmarshal(raw, &st); err != nil {
+					return nil, err
+				}
+				return &st, nil
+			}
+
+			st, err := fetchStatus(ws)
+			if err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				return
+			}
+			printInstalled(st)
+			fmt.Fprintln(out)
+			fmt.Fprintln(out, "Commands: ls  queued  mults  sourcefiles  install [--confirm]  help  exit")
+
+			prevHandler := sess.cityHandler
+			sess.setPromptStr("[cyan][[white]augmentations[cyan]][-] [green]>[-] ")
+			sess.setSubCompleter([]string{"ls", "queued", "mults", "sourcefiles", "install", "help", "alias", "unalias", "exit"})
+			sess.currentRepl = "augmentations"
+			inSubMode.Store(true)
+
+			sess.setContextRefresh("Augmentations", func(ws *websocket.Conn) {
+				st2, err2 := fetchStatus(ws)
+				if err2 != nil {
+					return
+				}
+				var sb strings.Builder
+				fmt.Fprintf(&sb, " [yellow]Queued: %d aug(s)[-]\n", len(st2.Queued))
+				if st2.NFGLevel > 0 {
+					fmt.Fprintf(&sb, " NFG: Level %d\n", st2.NFGLevel)
+				}
+				if st2.Entropy > 0 {
+					fmt.Fprintf(&sb, " Entropy: %d\n", st2.Entropy)
+				}
+				sb.WriteString(ctxSep)
+				for _, a := range st2.Queued {
+					fmt.Fprintf(&sb, " [green]%s[-]\n", a.Name)
+				}
+				text := sb.String()
+				sess.app.QueueUpdateDraw(func() { sess.contextView.SetText(text) })
+			})
+
+			sess.cityHandler = func(ws *websocket.Conn, out io.Writer, sess *session, line string) bool {
+				lp := strings.Fields(line)
+				if len(lp) == 0 {
+					return true
+				}
+				switch strings.ToLower(lp[0]) {
+				case "exit", "quit":
+					sess.cityHandler = prevHandler
+					if prevHandler == nil {
+						inSubMode.Store(false)
+					}
+					sess.currentRepl = "global"
+					sess.restoreCompleter()
+					sess.updatePrompt()
+					sess.clearContextRefresh()
+
+				case "ls", "list":
+					st2, err2 := fetchStatus(ws)
+					if err2 != nil {
+						fmt.Fprintf(out, "error: %v\n", err2)
+						return true
+					}
+					printInstalled(st2)
+
+				case "queued":
+					st2, err2 := fetchStatus(ws)
+					if err2 != nil {
+						fmt.Fprintf(out, "error: %v\n", err2)
+						return true
+					}
+					printQueued(st2)
+
+				case "mults":
+					st2, err2 := fetchStatus(ws)
+					if err2 != nil {
+						fmt.Fprintf(out, "error: %v\n", err2)
+						return true
+					}
+					printMults(st2)
+
+				case "sourcefiles":
+					st2, err2 := fetchStatus(ws)
+					if err2 != nil {
+						fmt.Fprintf(out, "error: %v\n", err2)
+						return true
+					}
+					printSourceFiles(st2)
+
+				case "install":
+					confirmed := false
+					for _, a := range lp[1:] {
+						if a == "--confirm" {
+							confirmed = true
+						}
+					}
+					if !confirmed {
+						fmt.Fprintln(out, "[red]╔════════════════════════════════════════════════════════════╗[-]")
+						fmt.Fprintln(out, "[red]║                       ⚠  WARNING  ⚠                        ║[-]")
+						fmt.Fprintln(out, "[red]╠════════════════════════════════════════════════════════════╣[-]")
+						fmt.Fprintln(out, "[red]║  Installing augmentations is DESTRUCTIVE:                  ║[-]")
+						fmt.Fprintln(out, "[red]║    • All running scripts will be killed.                   ║[-]")
+						fmt.Fprintln(out, "[red]║    • Skills reset to baseline; multipliers reapply.        ║[-]")
+						fmt.Fprintln(out, "[red]║    • Non-home server files are wiped.                      ║[-]")
+						fmt.Fprintln(out, "[red]║  Run 'install --confirm' to proceed.                       ║[-]")
+						fmt.Fprintln(out, "[red]╚════════════════════════════════════════════════════════════╝[-]")
+						return true
+					}
+					raw, err2 := sendMsgSync(ws, "doInstallAugmentations", nil)
+					if err2 != nil {
+						fmt.Fprintf(out, "error: %v\n", err2)
+						return true
+					}
+					var result string
+					if json.Unmarshal(raw, &result) == nil {
+						fmt.Fprintln(out, result)
+					}
+					select {
+					case sess.serverRefreshCh <- struct{}{}:
+					default:
+					}
+
+				case "alias":
+					am := replAliases(sess.currentRepl)
+					if len(lp) < 2 {
+						if len(am) == 0 {
+							fmt.Fprintln(out, "no aliases defined")
+						} else {
+							keys := make([]string, 0, len(am))
+							for k := range am {
+								keys = append(keys, k)
+							}
+							sort.Strings(keys)
+							for _, k := range keys {
+								fmt.Fprintf(out, "alias %s=%q\n", k, am[k])
+							}
+						}
+						return true
+					}
+					name := lp[1]
+					value := strings.Join(lp[2:], " ")
+					if value == "" && strings.Contains(name, "=") {
+						idx := strings.IndexByte(name, '=')
+						value = name[idx+1:]
+						name = name[:idx]
+					}
+					am[name] = value
+					saveAliases()
+					fmt.Fprintf(out, "alias %s=%q\n", name, value)
+
+				case "unalias":
+					if len(lp) < 2 {
+						fmt.Fprintln(out, "usage: unalias <name>")
+						return true
+					}
+					delete(replAliases(sess.currentRepl), lp[1])
+					saveAliases()
+
+				case "help":
+					helpTable(out, "Augmentations", [][2]string{
+						{"ls", "List installed augmentations and NFG/entropy levels"},
+						{"queued", "Show augmentations queued for installation"},
+						{"mults", "Show all non-default player multipliers"},
+						{"sourcefiles", "Show owned source files and their levels"},
+						{"install --confirm", "Install queued augmentations (DESTRUCTIVE — resets game)"},
+					})
+					helpTable(out, "Shell", [][2]string{
+						{"alias [name=\"value\"]", "Define an alias"},
+						{"unalias <name>", "Remove an alias"},
+						{"help", "Show this help"},
+						{"exit", "Return to top-level"},
+					})
+
+				default:
+					fmt.Fprintf(out, "unknown command: %s\n", lp[0])
+				}
+				return true
+			}
+		}},
 		{"help", func(ws *websocket.Conn, out io.Writer, sess *session, parts []string) {
 			helpTable(out, "Navigation", [][2]string{
 				{"connect <hostname>", "Connect to a server"},
@@ -3383,6 +4135,10 @@ func init() {
 				{"city", "Enter city sub-repl (travel, interact with locations)"},
 				{"hacknet", "Enter hacknet sub-repl"},
 				{"cloud", "Enter cloud servers sub-repl"},
+				{"programs", "Enter programs sub-repl (create hacking tools)"},
+				{"active_scripts", "Show all running scripts across all servers"},
+				{"factions", "Enter factions sub-repl (join, work, buy augs)"},
+				{"augmentations", "Enter augmentations sub-repl (install, view mults)"},
 			})
 			helpTable(out, "Server Info", [][2]string{
 				{"hostname", "Print current server hostname"},
@@ -3426,9 +4182,9 @@ func init() {
 				{"buy <item>", "Buy a specific darkweb item"},
 			})
 			helpTable(out, "Factions & Misc", [][2]string{
-				{"joinFaction <name>", "Accept a pending faction invitation"},
 				{"expr <expression>", "Evaluate a math expression"},
 				{"mkdir", "No-op (Bitburner has no real directories)"},
+				{"export_game", "Export save file to current directory"},
 			})
 			helpTable(out, "Shell", [][2]string{
 				{"alias [name=\"value\"]", "List all aliases or define a new one"},
@@ -4349,6 +5105,472 @@ func init() {
 				return true
 			}
 		}},
+
+		{"programs", func(ws *websocket.Conn, out io.Writer, sess *session, parts []string) {
+			raw, err := sendMsgSync(ws, "listCreatablePrograms", nil)
+			if err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				return
+			}
+			var progs []creatableProgramInfo
+			if err := json.Unmarshal(raw, &progs); err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				return
+			}
+
+			printPrograms := func(progs []creatableProgramInfo) {
+				w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+				fmt.Fprintln(w, "Program\tReq\tBase Time\tStatus")
+				for _, p := range progs {
+					status := "available"
+					if p.Owned {
+						status = "owned"
+					} else if !p.ReqMet {
+						status = fmt.Sprintf("need hack %d", p.ReqLevel)
+					} else if p.Progress > 0 {
+						status = fmt.Sprintf("%.1f%% complete (paused)", p.Progress)
+					}
+					fmt.Fprintf(w, "%s\t%d\t%s\t%s\n", p.Name, p.ReqLevel, formatTime(p.Time/1000), status)
+				}
+				w.Flush()
+			}
+
+			printPrograms(progs)
+			fmt.Fprintln(out)
+			fmt.Fprintln(out, "Commands: ls  create <program>  stop  help  exit")
+
+			// Cache non-owned program names for Tab completion.
+			names := make([]string, 0, len(progs))
+			for _, p := range progs {
+				if !p.Owned {
+					names = append(names, p.Name)
+				}
+			}
+			sess.programNames = names
+
+			prevHandler := sess.cityHandler
+			sess.setPromptStr("[cyan][[white]programs[cyan]][-] [green]>[-] ")
+			sess.setSubCompleter([]string{"ls", "create", "stop", "help", "alias", "unalias", "exit"})
+			sess.currentRepl = "programs"
+			inSubMode.Store(true)
+
+			sess.setContextRefresh("Programs", func(ws *websocket.Conn) {
+				var sb strings.Builder
+
+				// Current creation progress (if any).
+				if rawPP, err2 := sendMsgSync(ws, "getProgramProgress", nil); err2 == nil && string(rawPP) != "null" {
+					var pp programProgressResult
+					if json.Unmarshal(rawPP, &pp) == nil {
+						filled := int(pp.Progress / 100 * 12)
+						bar := strings.Repeat("█", filled) + strings.Repeat("░", 12-filled)
+						sb.WriteString(ctxHeader("Creating"))
+						fmt.Fprintf(&sb, " [cyan]%s[-]\n", pp.ProgramName)
+						fmt.Fprintf(&sb, " [yellow]%s[-] %.1f%%\n", bar, pp.Progress)
+					}
+				}
+
+				// Program list with owned/available indicators.
+				if rawList, err2 := sendMsgSync(ws, "listCreatablePrograms", nil); err2 == nil {
+					var list []creatableProgramInfo
+					if json.Unmarshal(rawList, &list) == nil {
+						sb.WriteString(ctxHeader("Programs"))
+						for _, p := range list {
+							if p.Owned {
+								fmt.Fprintf(&sb, " [green]✓[-] %s\n", p.Name)
+							} else if !p.ReqMet {
+								fmt.Fprintf(&sb, " [darkgray]· %s[-]\n", p.Name)
+							} else {
+								fmt.Fprintf(&sb, " [white]·[-] %s\n", p.Name)
+							}
+						}
+					}
+				}
+
+				text := sb.String()
+				sess.app.QueueUpdateDraw(func() { sess.contextView.SetText(text) })
+			})
+
+			sess.cityHandler = func(ws *websocket.Conn, out io.Writer, sess *session, line string) bool {
+				lp := strings.Fields(line)
+				if len(lp) == 0 {
+					return true
+				}
+				switch strings.ToLower(lp[0]) {
+				case "exit", "quit":
+					sess.cityHandler = prevHandler
+					if prevHandler == nil {
+						inSubMode.Store(false)
+					}
+					sess.currentRepl = "global"
+					sess.programNames = nil
+					sess.restoreCompleter()
+					sess.updatePrompt()
+					sess.clearContextRefresh()
+					return true
+
+				case "help":
+					helpTable(out, "Programs", [][2]string{
+						{"ls", "List creatable programs and their status"},
+						{"create <program>", "Start creating a program (background work)"},
+						{"stop", "Cancel current program creation"},
+						{"-", ""},
+						{"alias [name=\"value\"]", "Define an alias"},
+						{"unalias <name>", "Remove an alias"},
+						{"help", "Show this help"},
+						{"exit", "Return to top-level"},
+					})
+					return true
+
+				case "ls", "list":
+					raw, err := sendMsgSync(ws, "listCreatablePrograms", nil)
+					if err != nil {
+						fmt.Fprintf(out, "error: %v\n", err)
+						return true
+					}
+					var list []creatableProgramInfo
+					if err := json.Unmarshal(raw, &list); err != nil {
+						fmt.Fprintf(out, "error: %v\n", err)
+						return true
+					}
+					printPrograms(list)
+					// Refresh autocomplete cache.
+					names := make([]string, 0, len(list))
+					for _, p := range list {
+						if !p.Owned {
+							names = append(names, p.Name)
+						}
+					}
+					sess.programNames = names
+
+				case "create":
+					if len(lp) < 2 {
+						fmt.Fprintln(out, "usage: create <program>")
+						return true
+					}
+					progName := strings.Join(lp[1:], " ")
+					raw, err := sendMsgSync(ws, "startCreateProgram", map[string]any{"stat": progName})
+					if err != nil {
+						fmt.Fprintf(out, "error: %v\n", err)
+						return true
+					}
+					var msg string
+					_ = json.Unmarshal(raw, &msg)
+					fmt.Fprintln(out, msg)
+					select {
+					case sess.serverRefreshCh <- struct{}{}:
+					default:
+					}
+
+				case "stop":
+					raw, err := sendMsgSync(ws, "stopWork", nil)
+					if err != nil {
+						fmt.Fprintf(out, "error: %v\n", err)
+						return true
+					}
+					var msg string
+					_ = json.Unmarshal(raw, &msg)
+					fmt.Fprintln(out, msg)
+					select {
+					case sess.serverRefreshCh <- struct{}{}:
+					default:
+					}
+
+				case "alias":
+					am := replAliases(sess.currentRepl)
+					if len(lp) < 2 {
+						if len(am) == 0 {
+							fmt.Fprintln(out, "no aliases defined")
+						} else {
+							keys := make([]string, 0, len(am))
+							for k := range am {
+								keys = append(keys, k)
+							}
+							sort.Strings(keys)
+							for _, k := range keys {
+								fmt.Fprintf(out, "alias %s=%q\n", k, am[k])
+							}
+						}
+						return true
+					}
+					name := lp[1]
+					value := strings.Join(lp[2:], " ")
+					if value == "" && strings.Contains(name, "=") {
+						idx := strings.IndexByte(name, '=')
+						value = name[idx+1:]
+						name = name[:idx]
+					}
+					am[name] = value
+					saveAliases()
+					fmt.Fprintf(out, "alias %s=%q\n", name, value)
+
+				case "unalias":
+					if len(lp) < 2 {
+						fmt.Fprintln(out, "usage: unalias <name>")
+						return true
+					}
+					delete(replAliases(sess.currentRepl), lp[1])
+					saveAliases()
+
+				default:
+					fmt.Fprintf(out, "unknown command: %s\n", lp[0])
+				}
+				return true
+			}
+		}},
+
+		{"active_scripts", func(ws *websocket.Conn, out io.Writer, sess *session, parts []string) {
+			raw, err := sendMsgSync(ws, "getAllRunningScripts", nil)
+			if err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				return
+			}
+			var groups []serverScriptGroup
+			if err := json.Unmarshal(raw, &groups); err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				return
+			}
+
+			// pidServer maps PID → hostname for kill/logs lookups.
+			pidServer := map[int]string{}
+			for _, g := range groups {
+				for _, s := range g.Scripts {
+					pidServer[s.PID] = g.Hostname
+				}
+			}
+
+			printGroups := func(groups []serverScriptGroup) {
+				if len(groups) == 0 {
+					fmt.Fprintln(out, "no scripts running")
+					return
+				}
+				totalScripts := 0
+				for _, g := range groups {
+					totalScripts += len(g.Scripts)
+				}
+				for _, g := range groups {
+					scriptWord := "scripts"
+					if len(g.Scripts) == 1 {
+						scriptWord = "script"
+					}
+					fmt.Fprintf(out, "[%s]  RAM: %s / %s  •  %d %s\n",
+						g.Hostname, formatRAM(g.RamUsed), formatRAM(g.RamMax), len(g.Scripts), scriptWord)
+					w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+					fmt.Fprintln(w, "  PID\tT\tRAM\tRunning\tMoney\tScript")
+					for _, s := range g.Scripts {
+						args := ""
+						if len(s.Args) > 0 {
+							b, _ := json.Marshal(s.Args)
+							args = " " + string(b)
+						}
+						moneyStr := ""
+						if s.OnlineMoneyMade > 0 {
+							moneyStr = formatMoney(s.OnlineMoneyMade)
+						}
+						fmt.Fprintf(w, "  %d\t%d\t%s\t%s\t%s\t%s%s\n",
+							s.PID, s.Threads, formatRAM(s.RamUsage*float64(s.Threads)),
+							formatTime(s.OnlineRunningTime), moneyStr, s.Filename, args)
+					}
+					w.Flush()
+					fmt.Fprintln(out)
+				}
+				fmt.Fprintf(out, "Total: %d script(s) across %d server(s)\n", totalScripts, len(groups))
+			}
+
+			printGroups(groups)
+			fmt.Fprintln(out, "\nCommands: ls  kill <pid>  logs <pid>  help  exit")
+
+			prevHandler := sess.cityHandler
+			sess.setPromptStr("[cyan][[white]active_scripts[cyan]][-] [green]>[-] ")
+			sess.setSubCompleter([]string{"ls", "kill", "logs", "help", "alias", "unalias", "exit"})
+			sess.currentRepl = "active_scripts"
+			inSubMode.Store(true)
+
+			sess.setContextRefresh("Active Scripts", func(ws *websocket.Conn) {
+				rawG, err2 := sendMsgSync(ws, "getAllRunningScripts", nil)
+				if err2 != nil {
+					return
+				}
+				var gs []serverScriptGroup
+				if json.Unmarshal(rawG, &gs) != nil {
+					return
+				}
+				totalScripts := 0
+				totalRamUsed := 0.0
+				for _, g := range gs {
+					totalScripts += len(g.Scripts)
+					totalRamUsed += g.RamUsed
+				}
+				var sb strings.Builder
+				fmt.Fprintf(&sb, " [yellow]%d[-] scripts\n", totalScripts)
+				fmt.Fprintf(&sb, " [yellow]%d[-] servers\n", len(gs))
+				fmt.Fprintf(&sb, " [yellow]%s[-] RAM\n", formatRAM(totalRamUsed))
+				if len(gs) > 0 {
+					sb.WriteString(ctxSep)
+					sb.WriteString(ctxHeader("By Server"))
+					for _, g := range gs {
+						fmt.Fprintf(&sb, " [cyan]%s[-]\n", g.Hostname)
+						fmt.Fprintf(&sb, "  %d script(s)\n", len(g.Scripts))
+						sb.WriteString(ctxRAMBar(g.RamUsed, g.RamMax))
+						sb.WriteString("\n")
+					}
+				}
+				text := sb.String()
+				sess.app.QueueUpdateDraw(func() { sess.contextView.SetText(text) })
+			})
+
+			sess.cityHandler = func(ws *websocket.Conn, out io.Writer, sess *session, line string) bool {
+				lp := strings.Fields(line)
+				if len(lp) == 0 {
+					return true
+				}
+				switch strings.ToLower(lp[0]) {
+				case "exit", "quit":
+					sess.cityHandler = prevHandler
+					if prevHandler == nil {
+						inSubMode.Store(false)
+					}
+					sess.currentRepl = "global"
+					sess.restoreCompleter()
+					sess.updatePrompt()
+					sess.clearContextRefresh()
+					return true
+
+				case "help":
+					helpTable(out, "Active Scripts", [][2]string{
+						{"ls", "Refresh and display all running scripts"},
+						{"kill <pid>", "Kill a script by PID"},
+						{"logs <pid>", "Print the last 25 log lines for a script"},
+						{"-", ""},
+						{"alias [name=\"value\"]", "Define an alias"},
+						{"unalias <name>", "Remove an alias"},
+						{"help", "Show this help"},
+						{"exit", "Return to top-level"},
+					})
+					return true
+
+				case "ls", "refresh":
+					raw, err := sendMsgSync(ws, "getAllRunningScripts", nil)
+					if err != nil {
+						fmt.Fprintf(out, "error: %v\n", err)
+						return true
+					}
+					var gs []serverScriptGroup
+					if err := json.Unmarshal(raw, &gs); err != nil {
+						fmt.Fprintf(out, "error: %v\n", err)
+						return true
+					}
+					// Refresh PID→server cache.
+					pidServer = map[int]string{}
+					for _, g := range gs {
+						for _, s := range g.Scripts {
+							pidServer[s.PID] = g.Hostname
+						}
+					}
+					groups = gs
+					printGroups(gs)
+
+				case "kill":
+					if len(lp) < 2 {
+						fmt.Fprintln(out, "usage: kill <pid>")
+						return true
+					}
+					pid, err := strconv.Atoi(lp[1])
+					if err != nil {
+						fmt.Fprintf(out, "invalid PID: %s\n", lp[1])
+						return true
+					}
+					hostname, ok := pidServer[pid]
+					if !ok {
+						fmt.Fprintf(out, "PID %d not found — run 'ls' to refresh\n", pid)
+						return true
+					}
+					_, err = sendMsgSync(ws, "killScript", map[string]any{"server": hostname, "pid": pid})
+					if err != nil {
+						fmt.Fprintf(out, "error: %v\n", err)
+						return true
+					}
+					fmt.Fprintf(out, "killed PID %d on %s\n", pid, hostname)
+					delete(pidServer, pid)
+					select {
+					case sess.serverRefreshCh <- struct{}{}:
+					default:
+					}
+
+				case "logs":
+					if len(lp) < 2 {
+						fmt.Fprintln(out, "usage: logs <pid>")
+						return true
+					}
+					pid, err := strconv.Atoi(lp[1])
+					if err != nil {
+						fmt.Fprintf(out, "invalid PID: %s\n", lp[1])
+						return true
+					}
+					hostname, ok := pidServer[pid]
+					if !ok {
+						fmt.Fprintf(out, "PID %d not found — run 'ls' to refresh\n", pid)
+						return true
+					}
+					raw, err := sendMsgSync(ws, "getScriptLogs", map[string]any{"server": hostname, "pid": pid})
+					if err != nil {
+						fmt.Fprintf(out, "error: %v\n", err)
+						return true
+					}
+					var logs []string
+					if err := json.Unmarshal(raw, &logs); err != nil {
+						fmt.Fprintf(out, "error: %v\n", err)
+						return true
+					}
+					// Show last 25 lines.
+					if len(logs) > 25 {
+						logs = logs[len(logs)-25:]
+					}
+					for _, l := range logs {
+						fmt.Fprintln(out, l)
+					}
+
+				case "alias":
+					am := replAliases(sess.currentRepl)
+					if len(lp) < 2 {
+						if len(am) == 0 {
+							fmt.Fprintln(out, "no aliases defined")
+						} else {
+							keys := make([]string, 0, len(am))
+							for k := range am {
+								keys = append(keys, k)
+							}
+							sort.Strings(keys)
+							for _, k := range keys {
+								fmt.Fprintf(out, "alias %s=%q\n", k, am[k])
+							}
+						}
+						return true
+					}
+					name := lp[1]
+					value := strings.Join(lp[2:], " ")
+					if value == "" && strings.Contains(name, "=") {
+						idx := strings.IndexByte(name, '=')
+						value = name[idx+1:]
+						name = name[:idx]
+					}
+					am[name] = value
+					saveAliases()
+					fmt.Fprintf(out, "alias %s=%q\n", name, value)
+
+				case "unalias":
+					if len(lp) < 2 {
+						fmt.Fprintln(out, "usage: unalias <name>")
+						return true
+					}
+					delete(replAliases(sess.currentRepl), lp[1])
+					saveAliases()
+
+				default:
+					fmt.Fprintf(out, "unknown command: %s\n", lp[0])
+				}
+				return true
+			}
+		}},
 	}
 } // end init()
 
@@ -4475,6 +5697,20 @@ func handler(ws *websocket.Conn, sess *session) {
 						line = strings.Join(lp, " ")
 					}
 				}
+				lp2 := strings.Fields(line)
+				if len(lp2) > 0 && lp2[0] == "clear" {
+					sess.app.QueueUpdateDraw(func() { sess.outputView.Clear() })
+					continue
+				}
+				if len(lp2) > 0 && lp2[0] == "home" {
+					sess.cityHandler = nil
+					inSubMode.Store(false)
+					sess.restoreCompleter()
+					sess.updatePrompt()
+					sess.setServer("home")
+					fetchAndShowFiles(ws, out, sess)
+					continue
+				}
 				if !sess.cityHandler(ws, out, sess, line) {
 					sess.cityHandler = nil
 					inSubMode.Store(false)
@@ -4515,7 +5751,8 @@ func main() {
 
 	statsBar := tview.NewTextView().
 		SetDynamicColors(true).
-		SetScrollable(false)
+		SetScrollable(false).
+		SetWrap(false)
 	statsBar.SetBorder(true).SetTitle(" Player ")
 	statsBar.SetText("  [darkgray]waiting for connection[-]")
 
@@ -4727,14 +5964,19 @@ func main() {
 						if sess.seenInvites == nil {
 							sess.seenInvites = make(map[string]bool)
 						}
+						unread := 0
 						for _, name := range invites {
 							if !sess.seenInvites[name] {
 								sess.seenInvites[name] = true
-								fmt.Fprintf(sess.out, "[yellow]*** FACTION INVITE: %s — use 'joinFaction %s' to accept ***[-]\n", name, name)
+								delete(sess.readInvites, name) // new invite overrides a prior mark-read
+								fmt.Fprintf(sess.out, "[yellow]*** FACTION INVITE: %s — use 'factions' then 'join %s' to accept ***[-]\n", name, name)
+							}
+							if !sess.readInvites[name] {
+								unread++
 							}
 						}
-						if len(invites) > 0 {
-							line += fmt.Sprintf("  [yellow]⚡ %d invite(s)[-]", len(invites))
+						if unread > 0 {
+							line += fmt.Sprintf("  [yellow]⚡ %d invite(s)[-]", unread)
 						}
 					}
 				}
