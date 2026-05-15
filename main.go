@@ -446,6 +446,68 @@ type augmentationsStatus struct {
 	Mults       map[string]float64 `json:"mults"`
 }
 
+type wireEntry struct {
+	WireType string   `json:"wireType"`
+	Colors   []string `json:"colors"`
+}
+
+type infiltrationState struct {
+	Active             bool       `json:"active"`
+	StageName          string     `json:"stageName"`
+	Level              int        `json:"level"`
+	MaxLevel           int        `json:"maxLevel"`
+	Results            string     `json:"results"`
+	MsRemaining        int        `json:"msRemaining"`
+	Answer             string     `json:"answer"`
+	Guess              string     `json:"guess"`
+	Left               string     `json:"left"`
+	Right              string     `json:"right"`
+	Choices            []string   `json:"choices"`
+	Index              int        `json:"index"`
+	CorrectIndex       int        `json:"correctIndex"`
+	Code               []string   `json:"code"`
+	CodeIndex          int        `json:"codeIndex"`
+	Grid               [][]string `json:"grid"`
+	Answers            []string   `json:"answers"`
+	CurrentAnswerIndex int        `json:"currentAnswerIndex"`
+	X                  int        `json:"x"`
+	Y                  int        `json:"y"`
+	Minefield          [][]bool   `json:"minefield"`
+	MineAnswer         [][]bool   `json:"mineAnswer"`
+	MemoryPhase        bool       `json:"memoryPhase"`
+	Width              int        `json:"width"`
+	Height             int        `json:"height"`
+	Phase              int        `json:"phase"`
+	DistractedTime     float64    `json:"distractedTime"`
+	Wires              []wireEntry `json:"wires"`
+	Questions          []string   `json:"questions"`
+	WiresToCut         []int      `json:"wiresToCut"`
+	CutWires           []bool     `json:"cutWires"`
+	Count              int        `json:"count"`
+}
+
+type infiltrationSolveResult struct {
+	Ready   bool   `json:"ready"`
+	Message string `json:"message"`
+}
+
+type contractInfoResult struct {
+	Filename    string  `json:"filename"`
+	Type        string  `json:"type"`
+	Description string  `json:"description"`
+	TriesUsed   int     `json:"triesUsed"`
+	MaxTries    int     `json:"maxTries"`
+	Difficulty  float64 `json:"difficulty"`
+}
+
+type contractAttemptResult struct {
+	Success        bool   `json:"success"`
+	Message        string `json:"message"`
+	Reward         string `json:"reward"`
+	TriesRemaining int    `json:"triesRemaining"`
+	Destroyed      bool   `json:"destroyed"`
+}
+
 // ── Global state ──────────────────────────────────────────────────────────────
 
 var (
@@ -934,6 +996,238 @@ func formatTime(s float64) string {
 }
 
 // ── Context panel helpers ─────────────────────────────────────────────────────
+
+// tcellKeyToGameKey converts a tcell key event to the game's key string format.
+func tcellKeyToGameKey(event *tcell.EventKey) string {
+	switch event.Key() {
+	case tcell.KeyUp:
+		return "ArrowUp"
+	case tcell.KeyDown:
+		return "ArrowDown"
+	case tcell.KeyLeft:
+		return "ArrowLeft"
+	case tcell.KeyRight:
+		return "ArrowRight"
+	case tcell.KeyBackspace, tcell.KeyBackspace2:
+		return "Backspace"
+	case tcell.KeyRune:
+		return string(event.Rune())
+	}
+	return ""
+}
+
+// renderInfiltrationState formats mini-game state for the contextView.
+func renderInfiltrationState(s infiltrationState) string {
+	colorName := func(c string) string {
+		if v, ok := wireColorMap[c]; ok {
+			return v
+		}
+		return c
+	}
+
+	header := fmt.Sprintf("[yellow]Infiltration[-] %d/%d  %s\n", s.Level, s.MaxLevel, s.Results)
+	if s.MsRemaining > 0 && s.StageName != "CountdownModel" && s.StageName != "VictoryModel" {
+		header += fmt.Sprintf("[red]%.1fs[-]\n", float64(s.MsRemaining)/1000)
+	}
+
+	tab := "\n[gray]Tab=auto-solve  Esc=cancel[-]\n"
+
+	switch s.StageName {
+	case "CountdownModel":
+		return header + fmt.Sprintf("\n[yellow]%d...[-]", s.Count)
+
+	case "VictoryModel":
+		return header + "\n[green]VICTORY![-]\n\nInfiltration complete!"
+
+	case "SlashModel":
+		phases := []string{"GUARDING", "[green]SLASH![-]", "[red]ALERTED[-]"}
+		bar := ""
+		for i, p := range phases {
+			if i == s.Phase {
+				bar += "[yellow]>[" + p + "]<[-]"
+			} else {
+				bar += " " + p + " "
+			}
+		}
+		return header + "\nSLASH GAME\n\n" + bar + "\n\nPress [yellow]SPACE[-] when SLASH!\n" + tab
+
+	case "BackwardModel":
+		progress := ""
+		for i := range s.Answer {
+			if i < len(s.Guess) {
+				progress += string(s.Guess[i])
+			} else if i == len(s.Guess) {
+				progress += "[yellow]_[-]"
+			} else {
+				progress += " "
+			}
+		}
+		return header + "\nBACKWARD GAME\n\nType backward:\n  " + s.Answer + "\n\nYour input:\n  " + progress + tab
+
+	case "BracketModel":
+		progress := s.Right
+		if len(s.Right) < len(s.Left) {
+			progress += "[yellow]_[-]"
+		}
+		return header + "\nBRACKET GAME\n\nClose brackets:\n  " + s.Left + "\n\nYour input:\n  " + progress + tab
+
+	case "BribeModel":
+		const maxVisible = 7
+		var sb strings.Builder
+		sb.WriteString(header + "\nBRIBE GAME\n\nPick the positive trait:\n\n")
+		start := 0
+		if len(s.Choices) > maxVisible && s.Index > maxVisible/2 {
+			start = s.Index - maxVisible/2
+			if start+maxVisible > len(s.Choices) {
+				start = len(s.Choices) - maxVisible
+			}
+		}
+		end := start + maxVisible
+		if end > len(s.Choices) {
+			end = len(s.Choices)
+		}
+		for i := start; i < end; i++ {
+			if i == s.Index {
+				sb.WriteString("[yellow]> " + s.Choices[i] + "[-]\n")
+			} else {
+				sb.WriteString("  " + s.Choices[i] + "\n")
+			}
+		}
+		sb.WriteString("\n↑/↓ move  SPACE confirm" + tab)
+		return sb.String()
+
+	case "CheatCodeModel":
+		var sb strings.Builder
+		sb.WriteString(header + "\nCHEAT CODE\n\n")
+		for i, arrow := range s.Code {
+			if i == s.CodeIndex {
+				sb.WriteString("[yellow]>" + arrow + "<[-]")
+			} else if i < s.CodeIndex {
+				sb.WriteString("[green]" + arrow + "[-]")
+			} else {
+				sb.WriteString(arrow)
+			}
+			sb.WriteString(" ")
+		}
+		sb.WriteString(tab)
+		return sb.String()
+
+	case "Cyberpunk2077Model":
+		var sb strings.Builder
+		remaining := len(s.Answers) - s.CurrentAnswerIndex
+		target := ""
+		if s.CurrentAnswerIndex < len(s.Answers) {
+			target = s.Answers[s.CurrentAnswerIndex]
+		}
+		sb.WriteString(header + fmt.Sprintf("\nCYBERPUNK 2077\nFind: [yellow]%s[-] (%d left)\n\n", target, remaining))
+		for row, rowData := range s.Grid {
+			for col, cell := range rowData {
+				if row == s.Y && col == s.X {
+					sb.WriteString("[yellow][" + cell + "][-]")
+				} else if cell == target {
+					sb.WriteString("[green]" + cell + "[-] ")
+				} else {
+					sb.WriteString(cell + " ")
+				}
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\nArrows=move  SPACE=select" + tab)
+		return sb.String()
+
+	case "MinesweeperModel":
+		var sb strings.Builder
+		if s.MemoryPhase {
+			sb.WriteString(header + fmt.Sprintf("\n[red]MEMORIZE MINES![-] %.1fs\n\n", float64(s.MsRemaining)/1000))
+			for _, rowData := range s.Minefield {
+				for _, isMine := range rowData {
+					if isMine {
+						sb.WriteString("[red][*][-]")
+					} else {
+						sb.WriteString("[ ]")
+					}
+				}
+				sb.WriteString("\n")
+			}
+		} else {
+			sb.WriteString(header + "\nMINESWEEPER\nMark all mines\n\n")
+			for row, rowData := range s.Minefield {
+				for col := range rowData {
+					marked := row < len(s.MineAnswer) && col < len(s.MineAnswer[row]) && s.MineAnswer[row][col]
+					cursor := row == s.Y && col == s.X
+					if cursor {
+						sb.WriteString("[yellow]>[")
+					} else {
+						sb.WriteString(" [")
+					}
+					if marked {
+						sb.WriteString("[red]![-]")
+					} else {
+						sb.WriteString(" ")
+					}
+					if cursor {
+						sb.WriteString("][yellow]<[-]")
+					} else {
+						sb.WriteString("] ")
+					}
+				}
+				sb.WriteString("\n")
+			}
+			sb.WriteString("\nArrows=move  SPACE=mark" + tab)
+		}
+		return sb.String()
+
+	case "WireCuttingModel":
+		var sb strings.Builder
+		sb.WriteString(header + "\nWIRE CUTTING\n\nRules:\n")
+		for _, q := range s.Questions {
+			sb.WriteString("  " + q + "\n")
+		}
+		sb.WriteString("\nWires:\n")
+		for i, w := range s.Wires {
+			cut := i < len(s.CutWires) && s.CutWires[i]
+			num := fmt.Sprintf("%d", i+1)
+			colors := ""
+			for _, c := range w.Colors {
+				colors += colorName(c) + " "
+			}
+			if cut {
+				sb.WriteString(fmt.Sprintf("  [gray]%s:CUT[-]\n", num))
+			} else {
+				sb.WriteString(fmt.Sprintf("  %s:%s\n", num, colors))
+			}
+		}
+		sb.WriteString("\nPress [yellow]1–9[-] to cut" + tab)
+		return sb.String()
+
+	default:
+		return header + "\n" + s.StageName
+	}
+}
+
+var (
+	reBlockTag = regexp.MustCompile(`(?i)</?(?:p|br|div|h[1-6]|li|tr|th|td|blockquote|pre|hr)[^>]*>`)
+	reAnyTag   = regexp.MustCompile(`<[^>]+>`)
+)
+
+var wireColorMap = map[string]string{
+	"red": "[red]RED[-]", "#FFC107": "[yellow]YELLOW[-]", "blue": "[blue]BLUE[-]", "white": "WHITE",
+}
+
+// stripHTML converts HTML to plain text suitable for terminal display.
+func stripHTML(s string) string {
+	s = reBlockTag.ReplaceAllString(s, "\n")
+	s = reAnyTag.ReplaceAllString(s, "")
+	s = strings.NewReplacer(
+		"&amp;", "&", "&lt;", "<", "&gt;", ">",
+		"&quot;", `"`, "&#39;", "'", "&nbsp;", " ",
+	).Replace(s)
+	// collapse runs of 3+ newlines to 2
+	for strings.Contains(s, "\n\n\n") {
+		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
+	}
+	return strings.TrimSpace(s)
+}
 
 // helpTable formats a list of [cmd, description] pairs into a two-column table.
 // An empty cmd acts as a section divider (prints the description as a header line).
@@ -2871,7 +3165,24 @@ func init() {
 				fmt.Fprintln(out, "usage: cat <filename>")
 				return
 			}
-			raw, err := sendMsgSync(ws, "getFile", map[string]string{"server": sess.currentServer, "filename": parts[1]})
+			name := parts[1]
+			if strings.HasSuffix(name, ".cct") {
+				raw, err := sendMsgSync(ws, "getContractInfo", map[string]string{"server": sess.currentServer, "filename": name})
+				if err != nil {
+					fmt.Fprintf(out, "error: %v\n", err)
+					return
+				}
+				var info contractInfoResult
+				if err := json.Unmarshal(raw, &info); err != nil {
+					fmt.Fprintf(out, "error parsing response: %v\n", err)
+					return
+				}
+				fmt.Fprintf(out, "[yellow]%s[-]  [darkgray](%s, difficulty %.0f)[-]\n", info.Filename, info.Type, info.Difficulty)
+				fmt.Fprintf(out, "[red]Tries: %d / %d[-]\n\n", info.TriesUsed, info.MaxTries)
+				fmt.Fprintln(out, info.Description)
+				return
+			}
+			raw, err := sendMsgSync(ws, "getFile", map[string]string{"server": sess.currentServer, "filename": name})
 			if err != nil {
 				fmt.Fprintf(out, "error: %v\n", err)
 				return
@@ -2881,7 +3192,43 @@ func init() {
 				fmt.Fprintf(out, "error parsing response: %v\n", err)
 				return
 			}
+			if strings.HasSuffix(name, ".lit") || strings.HasSuffix(name, ".msg") {
+				content = stripHTML(content)
+			}
 			fmt.Fprintln(out, content)
+		}},
+		{"attempt", func(ws *websocket.Conn, out io.Writer, sess *session, parts []string) {
+			if len(parts) < 3 {
+				fmt.Fprintln(out, "usage: attempt <file.cct> <answer>")
+				return
+			}
+			filename := parts[1]
+			if !strings.HasSuffix(filename, ".cct") {
+				fmt.Fprintln(out, "error: filename must end in .cct")
+				return
+			}
+			answer := strings.Join(parts[2:], " ")
+			raw, err := sendMsgSync(ws, "attemptContract", map[string]string{
+				"server":   sess.currentServer,
+				"filename": filename,
+				"content":  answer,
+			})
+			if err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				return
+			}
+			var res contractAttemptResult
+			if err := json.Unmarshal(raw, &res); err != nil {
+				fmt.Fprintf(out, "error parsing response: %v\n", err)
+				return
+			}
+			if res.Success {
+				fmt.Fprintf(out, "[green]%s[-]\n", res.Message)
+			} else if res.Destroyed {
+				fmt.Fprintf(out, "[red]%s[-]\n", res.Message)
+			} else {
+				fmt.Fprintf(out, "[yellow]%s[-]\n", res.Message)
+			}
 		}},
 		{"cp", func(ws *websocket.Conn, out io.Writer, sess *session, parts []string) {
 			if len(parts) < 3 {
@@ -3478,6 +3825,126 @@ func init() {
 			case sess.serverRefreshCh <- struct{}{}:
 			default:
 			}
+		}},
+		{"infiltrate", func(ws *websocket.Conn, out io.Writer, sess *session, parts []string) {
+			if len(parts) < 2 {
+				fmt.Fprintln(out, "usage: infiltrate <location>")
+				return
+			}
+			location := strings.Join(parts[1:], " ")
+			raw, err := sendMsgSync(ws, "startInfiltration", map[string]string{"location": location})
+			if err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				return
+			}
+			var startMsg string
+			if err := json.Unmarshal(raw, &startMsg); err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				return
+			}
+			fmt.Fprintln(out, startMsg)
+			fmt.Fprintln(out, "[darkgray]Tab=auto-solve  Esc=cancel  (keys forwarded to game)[-]")
+
+			// Save original app input capture so we can restore it.
+			origCapture := sess.app.GetInputCapture()
+			var teardownOnce sync.Once
+			doneCh := make(chan struct{})
+
+			teardown := func() {
+				sess.app.QueueUpdateDraw(func() {
+					sess.app.SetInputCapture(origCapture)
+					sess.clearContextRefresh()
+				})
+			}
+
+			sess.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+				select {
+				case <-doneCh:
+					// Infiltration ended — pass through to original.
+					if origCapture != nil {
+						return origCapture(event)
+					}
+					return event
+				default:
+				}
+
+				if event.Key() == tcell.KeyEscape {
+					go func() {
+						sendMsgSync(ws, "cancelInfiltration", map[string]string{})
+						fmt.Fprintln(out, "Infiltration cancelled.")
+						teardownOnce.Do(func() {
+							close(doneCh)
+							teardown()
+						})
+					}()
+					return nil
+				}
+
+				if event.Key() == tcell.KeyTab {
+					go func() {
+						raw, err := sendMsgSync(ws, "solveInfiltrationGame", map[string]string{})
+						if err != nil {
+							return
+						}
+						var res infiltrationSolveResult
+						if err := json.Unmarshal(raw, &res); err != nil {
+							return
+						}
+						if !res.Ready {
+							fmt.Fprintln(out, "[gray](not ready — try again)[-]")
+						}
+					}()
+					return nil
+				}
+
+				key := tcellKeyToGameKey(event)
+				if key == "" {
+					// Non-game key — pass through to original handler.
+					if origCapture != nil {
+						return origCapture(event)
+					}
+					return event
+				}
+				go func() {
+					sendMsgSync(ws, "sendInfiltrationKey", map[string]string{"key": key})
+				}()
+				return nil
+			})
+
+			// Polling goroutine: update contextView every 100ms.
+			go func() {
+				ticker := time.NewTicker(100 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-doneCh:
+						return
+					case <-ticker.C:
+					}
+					raw, err := sendMsgSync(ws, "getInfiltrationState", map[string]string{})
+					if err != nil {
+						continue
+					}
+					var state infiltrationState
+					if err := json.Unmarshal(raw, &state); err != nil {
+						continue
+					}
+					if !state.Active {
+						sess.app.QueueUpdateDraw(func() {
+							fmt.Fprintln(out, "Infiltration ended.")
+						})
+						teardownOnce.Do(func() {
+							close(doneCh)
+							teardown()
+						})
+						return
+					}
+					text := renderInfiltrationState(state)
+					sess.app.QueueUpdateDraw(func() {
+						sess.contextView.SetText(text)
+					})
+				}
+			}()
 		}},
 		{"factions", func(ws *websocket.Conn, out io.Writer, sess *session, parts []string) {
 			printFactions := func(facs []factionInfoResult) {
